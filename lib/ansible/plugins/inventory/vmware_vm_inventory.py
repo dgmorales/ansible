@@ -27,6 +27,9 @@ DOCUMENTATION = '''
       - "vSphere Automation SDK - For tag feature"
       - "vCloud Suite SDK - For tag feature"
     options:
+        datacenter:
+            description: Datacenter name. Required if `search_folder` or `with_folders` are set, otherwise ignored.
+            required: False
         hostname:
             description: Name of vCenter or ESXi server.
             required: True
@@ -47,10 +50,17 @@ DOCUMENTATION = '''
             default: 443
             env:
               - name: VMWARE_PORT
+        search_folder:
+            description: Inventory path for the root folder of the VM search. Requires `datacenter` to be set.
+            required: False
         validate_certs:
             description:
             - Allows connection when SSL certificates are not valid. Set to C(false) when certificates are not trusted.
             default: True
+            type: boolean
+        with_folders:
+            description: Create groups based on the folder hierarchy of the VCenter Inventory. Requires  `datacenter` to be set.
+            default: False
             type: boolean
         with_tags:
             description:
@@ -72,10 +82,23 @@ EXAMPLES = '''
     password: Esxi@123$%
     validate_certs: False
     with_tags: True
+
+# Example limiting the inventory to a subfolder, and creating groups based on folders
+    plugin: vmware_vm_inventory
+    strict: False
+    hostname: 10.65.223.31
+    username: administrator@vsphere.local
+    password: Esxi@123$%
+    validate_certs: False
+    with_tags: True
+    datacenter: MyDC
+    with_folders: True
+    search_folder: Folder1/SubFolderA
 '''
 
 import ssl
 import atexit
+from collections import namedtuple
 from ansible.errors import AnsibleError, AnsibleParserError
 
 try:
@@ -126,7 +149,20 @@ class InventoryModule(BaseInventoryPlugin, Cacheable):
         self.port = self.get_option('port')
         self.with_tags = self.get_option('with_tags')
 
+        self.with_folders = self.get_option('with_folders')
+        self.search_folder = self.get_option('search_folder')
+        self.datacenter = self.get_option('datacenter')
+
+        # Slashes are significant to our folder logic, so let's make sure we sanitize the input
+        if self.search_folder:
+            self.search_folder = self.search_folder.strip('/')
+        if self.datacenter:
+            self.datacenter = self.datacenter.strip('/')
+
         self.validate_certs = self.get_option('validate_certs')
+
+        if (self.with_folders or self.search_folder) and not self.datacenter:
+            raise AnsibleError("You must set the 'datacenter' param when setting either 'search_folder' or 'with_folders'.")
 
         if not HAS_VSPHERE and self.with_tags:
             raise AnsibleError("Unable to find 'vSphere Automation SDK' Python library which is required."
@@ -284,6 +320,19 @@ class InventoryModule(BaseInventoryPlugin, Cacheable):
         if self.with_tags:
             self.rest_content = self._login_vapi()
 
+        # Get the folder object that will serve as our inventory root folder
+        if self.search_folder:
+            self.root_folder = self.content.searchIndex.FindByInventoryPath('%s/vm/%s' % (self.datacenter, self.search_folder))
+            if not self.root_folder:
+                raise AnsibleError("Specified datacenter + search_folder '%s/vm/%s' were not found on Inventory." %
+                                   (self.datacenter, self.search_folder))
+        elif self.with_folders:
+            self.root_folder = self.content.searchIndex.FindByInventoryPath('%s/vm' % self.datacenter)
+            if not self.root_folder:
+                raise AnsibleError("Specified datacenter '%s' was not found on Inventory." % self.datacenter)
+        else:
+            self.root_folder = self.content.rootFolder
+
         using_current_cache = cache and not update_cache
         cacheable_results = self._populate_from_source(source_data, using_current_cache)
 
@@ -316,6 +365,74 @@ class InventoryModule(BaseInventoryPlugin, Cacheable):
                 return None
         return result
 
+    def _create_folder_groups(self, folder_objects):
+        """
+        Creates groups matching the folder hierarchy in vCenter
+
+        folder_objects is the result of a _get_managed_objects_properties call with vim_type set to vim.Folder.
+        This only create the groups in the inventory, it does not associate any VMs to them.
+        """
+        # This function walks through the provided folder_objects, and builds
+        # an auxiliary dict self.vcenter_folders. That dict will hold a map
+        # from vmware's folder object ID to a namedtuple that holds:
+        # - The folder actual name
+        # - The folder *path* (relative to the root datacenter_folder/vm/)
+        # - The ansible group name, derived from the path
+        # - The folder children, which exists only so we can build the path
+        #
+        # This vcenter_folder exists mainly because I didn't figure it out a
+        # property of the vim.VirtualMachine object that already holds the
+        # path. If that exists, please tell me and we can replace this.
+        #
+        # We will use that map later to add each discovered hosts to the right
+        # ansible group.
+
+        def path2group_name(path):
+            'A quick function to create an ansible group name derived from a vCenter folder path'
+            return path.strip('/').replace('/', '_').lower()
+
+        VcenterFolder = namedtuple('VcenterFolder', ['name', 'path', 'children', 'ansible_group_name'])
+
+        # The map starts with self.root_folder. If a search_folder was
+        # specified, we will create it as a parent group (that it would be
+        # the same as the all group in practice). We do this because we want
+        # that running the inventory limited to a search_folder or not should
+        # yield the same groups and group names for the VMs inside the search
+        # folder.
+        #
+        # The slashes (/) are significant for the group names, so we take caution
+        # of handling then consistently.
+        if self.search_folder:
+            root_folder_path = '/%s/' % self.search_folder
+        else:
+            root_folder_path = '/'
+        self.vcenter_folders = {self.root_folder: VcenterFolder(
+            name=self.root_folder.name,
+            path=root_folder_path,
+            children=[],
+            ansible_group_name=path2group_name(root_folder_path),
+        )}
+
+        for temp_folder_object in folder_objects:
+            folder_obj = temp_folder_object.obj
+            path = '%s%s/' % (self.vcenter_folders[folder_obj.parent].path, folder_obj.name)
+            self.vcenter_folders[folder_obj] = VcenterFolder(
+                name=folder_obj.name,
+                path=path,
+                children=[],
+                ansible_group_name=path2group_name(path),
+            )
+            self.vcenter_folders[folder_obj.parent].children.append(self.vcenter_folders[folder_obj])
+
+        for folder in self.vcenter_folders.values():
+            if folder.ansible_group_name != '':
+                self.inventory.add_group(folder.ansible_group_name)
+
+        for folder in self.vcenter_folders.values():
+            if folder.ansible_group_name != '':
+                for child in folder.children:
+                    self.inventory.add_child(folder.ansible_group_name, child.ansible_group_name)
+
     def _populate_from_source(self, source_data, using_current_cache):
         """
         Populate inventory data from direct source
@@ -327,6 +444,10 @@ class InventoryModule(BaseInventoryPlugin, Cacheable):
 
         cacheable_results = {}
         hostvars = {}
+
+        if self.with_folders:
+            self._create_folder_groups(self._get_managed_objects_properties(vim_type=vim.Folder, properties=['name']))
+
         objects = self._get_managed_objects_properties(vim_type=vim.VirtualMachine, properties=['name'])
 
         if self.with_tags:
@@ -402,6 +523,15 @@ class InventoryModule(BaseInventoryPlugin, Cacheable):
                     cacheable_results[vm_guest_id].append(current_host)
                     self.inventory.add_child(vm_guest_id, current_host)
 
+                    # Based on folder
+                    if self.with_folders:
+                        folder_group_name = self.vcenter_folders[temp_vm_object.obj.parent].ansible_group_name
+                        if folder_group_name != '':
+                            if folder_group_name not in cacheable_results:
+                                cacheable_results[folder_group_name] = []
+                            cacheable_results[folder_group_name].append(current_host)
+                            self.inventory.add_child(folder_group_name, current_host)
+
         return cacheable_results
 
     def _get_managed_objects_properties(self, vim_type, properties=None):
@@ -411,14 +541,11 @@ class InventoryModule(BaseInventoryPlugin, Cacheable):
         :param properties: List of properties related to vim object e.g. Name
         :return: local content object
         """
-        # Get Root Folder
-        root_folder = self.content.rootFolder
-
         if properties is None:
             properties = ['name']
 
         # Create Container View with default root folder
-        mor = self.content.viewManager.CreateContainerView(root_folder, [vim_type], True)
+        mor = self.content.viewManager.CreateContainerView(self.root_folder, [vim_type], True)
 
         # Create Traversal spec
         traversal_spec = vmodl.query.PropertyCollector.TraversalSpec(
